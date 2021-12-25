@@ -27,7 +27,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "Usage: mrsequential xxx.so inputfiles...\n")
 		os.Exit(1)
 	}
-
+	//返回两个函数指针，从so文件里读取函数
 	mapf, reducef := loadPlugin(os.Args[1])
 
 	//
@@ -35,7 +35,11 @@ func main() {
 	// pass it to Map,
 	// accumulate the intermediate Map output.
 	//
+	/*
+		下面是处理
+	*/
 	intermediate := []mr.KeyValue{}
+	// 有多个file, 所以是os.Args[2:]
 	for _, filename := range os.Args[2:] {
 		file, err := os.Open(filename)
 		if err != nil {
@@ -46,7 +50,7 @@ func main() {
 			log.Fatalf("cannot read %v", filename)
 		}
 		file.Close()
-		kva := mapf(filename, string(content))
+		kva := mapf(filename, string(content)) // 获取一个file里的所有键值对 {word, 1}
 		intermediate = append(intermediate, kva...)
 	}
 
