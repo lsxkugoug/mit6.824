@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log"
 	"sync"
+	"time"
 )
 import "net"
 import "os"
@@ -15,17 +16,38 @@ type Coordinator struct {
 	// Your definitions here.
 	files              []string // 需要处理的文件名
 	mapTask            []int    // mapTask的完成情况 0_ 没有派发 1_已派发 2_已完成
+	mapTimeout         []int64  // 用于处理map任务的timeout -1代表初始状态
 	reduceTask         []int    // mapTask的完成情况 0_ 没有派发 1_已派发 2_已完成
+	reduceTimeout      []int64  //用于处理reduce任务的timeout -1代表初始状态
 	completedMapNum    int      //已完成Map任务数量
 	completedReduceNum int      //已完成的reduce任务数量
 	nReduce            int      //需要的reduce数量
 	mu                 sync.Mutex
 }
 
+func (c *Coordinator) CheckMapTimeout() {
+	for i := 0; i < len(c.mapTimeout); i++ {
+		if c.mapTask[i] == 1 && time.Now().UnixMilli()-c.mapTimeout[i] >= 10000 {
+			c.mapTimeout[i] = time.Now().UnixMilli()
+			c.mapTask[i] = 0
+		}
+	}
+}
+
+func (c *Coordinator) CheckReduceTimeout() {
+	for i := 0; i < len(c.reduceTimeout); i++ {
+		if c.reduceTask[i] == 1 && time.Now().UnixMilli()-c.reduceTimeout[i] >= 10000 {
+			c.reduceTimeout[i] = time.Now().UnixMilli()
+			c.reduceTask[i] = 0
+		}
+	}
+}
+
 // the RPC argument and reply types are defined in rpc.go.
 func (c *Coordinator) MapHandler(req *WkToCor, reply *CorToWk) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.CheckMapTimeout()
 	// worker告知已经完成map任务
 	if req.ReqType == 1 {
 		completedId := req.CompletedTaskId
@@ -51,6 +73,7 @@ func (c *Coordinator) MapHandler(req *WkToCor, reply *CorToWk) error {
 			c.mapTask[i] = 1
 			reply.TaskName = c.files[i]
 			reply.TaskId = i
+			c.mapTimeout[i] = time.Now().UnixMilli()
 			fmt.Fprintf(os.Stdout, "coordinator: distribute map "+
 				"task, filename: %v, taskId: %v\n", reply.TaskName, reply.TaskId)
 			break
@@ -58,9 +81,11 @@ func (c *Coordinator) MapHandler(req *WkToCor, reply *CorToWk) error {
 	}
 	return nil
 }
+
 func (c *Coordinator) ReduceHandler(req *WkToCor, reply *CorToWk) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.CheckReduceTimeout()
 	// worker告知已经完成任务
 	if req.ReqType == 1 {
 		completedId := req.CompletedTaskId
@@ -85,6 +110,7 @@ func (c *Coordinator) ReduceHandler(req *WkToCor, reply *CorToWk) error {
 			reply.TaskName = ""
 			reply.TaskId = i
 			reply.NMap = len(c.mapTask)
+			c.reduceTimeout[i] = time.Now().UnixMilli()
 			fmt.Fprintf(os.Stdout, "coordinator: distribute reduce "+
 				"task, filename: %v, taskId: %v\n", reply.TaskName, reply.TaskId)
 			break
@@ -131,11 +157,13 @@ func (c *Coordinator) Done() bool {
 //
 func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	mapTaskNum := len(files)
-	var mapTask = make([]int, mapTaskNum)
-	var reduceTask = make([]int, nReduce)
+	mapTask := make([]int, mapTaskNum)
+	mapTimeout := make([]int64, mapTaskNum)
+	reduceTask := make([]int, nReduce)
+	reduceTimeout := make([]int64, nReduce)
 
 	c := Coordinator{files: files, mapTask: mapTask, reduceTask: reduceTask, completedMapNum: 0,
-		completedReduceNum: 0, nReduce: nReduce}
+		completedReduceNum: 0, nReduce: nReduce, mapTimeout: mapTimeout, reduceTimeout: reduceTimeout}
 	fmt.Fprintf(os.Stdout, "coordinator: coordinator parameter: %v\n", c)
 	/* process map request*/
 	c.server()
