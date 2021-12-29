@@ -14,15 +14,15 @@ import "strconv"
 // and reply for an RPC.
 //
 
-// workers向coordinator返回自己已经完成的任务
-type wkToCor struct {
-	reqType         int // 0为请求 1为告知已经完成任务
-	completedTaskId int // 在master 数组里对应filename的 i
+// WkToCor workers向coordinator返回自己已经完成的任务
+type WkToCor struct {
+	ReqType         int // 0为请求 1为告知已经完成任务
+	CompletedTaskId int // 在master 数组里对应filename的 i
 }
 
-// coordinator向workers颁发任务
-type corToWk struct {
-	respType int // 0为请求map， 1为请求reduce
+// CorToWk coordinator向workers颁发任务
+type CorToWk struct {
+	RespType int // 0为请求map， 1为请求reduce
 	/**
 	taskName:
 		for map phase:
@@ -34,10 +34,10 @@ type corToWk struct {
 			如果是 &……%reduceTaskCompleted，代表可以结束了
 	*/
 
-	taskName string //maptask or reducetask, mr-x-y 为y
-	nMap     int    // map任务的数量，用于给reduce阶段的machine提供 -x
-	nReduce  int    //最终要拆分成的文件数量 mr-x-y y=hash(key) % nReduce
-	taskId   int    // 在master 数组里对应filename的 i
+	TaskName string //maptask or reducetask, mr-x-y 为y
+	NMap     int    // map任务的数量，用于给reduce阶段的machine提供 -x
+	NReduce  int    //最终要拆分成的文件数量 mr-x-y y=hash(key) % nReduce
+	TaskId   int    // 在master 数组里对应filename的 i
 
 }
 

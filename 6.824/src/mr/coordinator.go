@@ -1,6 +1,7 @@
 package mr
 
 import (
+	"fmt"
 	"log"
 	"sync"
 )
@@ -9,7 +10,7 @@ import "os"
 import "net/rpc"
 import "net/http"
 
-// c Coordinator rpc注册对象
+// Coordinator c rpc注册对象
 type Coordinator struct {
 	// Your definitions here.
 	files              []string // 需要处理的文件名
@@ -22,71 +23,77 @@ type Coordinator struct {
 }
 
 // the RPC argument and reply types are defined in rpc.go.
-func (c *Coordinator) mapHandler(req *wkToCor, reply *corToWk) error {
+func (c *Coordinator) MapHandler(req *WkToCor, reply *CorToWk) error {
 	c.mu.Lock()
+	defer c.mu.Unlock()
 	// worker告知已经完成map任务
-	if req.reqType == 1 {
-		completedId := req.completedTaskId
+	if req.ReqType == 1 {
+		completedId := req.CompletedTaskId
 		if c.mapTask[completedId] == 1 {
 			c.mapTask[completedId] = 2
 			c.completedMapNum++
 		}
+		return nil
 	}
-	reply.respType = 0
-	reply.nReduce = c.nReduce
+	reply.NReduce = c.nReduce
+	reply.RespType = 0
+	reply.NMap = len(c.mapTask)
 	if c.completedMapNum < len(c.mapTask) {
 		//表示没有需要的worker handle的map任务,
 		//workers将会循环请求直到cordinator发送wokers map任务结束，即所有map任务均已完成
-		reply.taskName = "*&……%noMapTask"
+		reply.TaskName = "*&……%noMapTask"
 	} else {
-		reply.taskName = "*&……%mapTaskCompleted"
+		reply.TaskName = "*&……%mapTaskCompleted"
 	}
+	//尝试找到没有分配的任务并分配过去
 	for i := 0; i < len(c.mapTask); i++ {
 		if c.mapTask[i] == 0 {
 			c.mapTask[i] = 1
-			reply.taskName = c.files[i]
-			reply.taskId = i
+			reply.TaskName = c.files[i]
+			reply.TaskId = i
+			fmt.Fprintf(os.Stdout, "coordinator: distribute map "+
+				"task, filename: %v, taskId: %v\n", reply.TaskName, reply.TaskId)
 			break
 		}
 	}
-	c.mu.Unlock()
 	return nil
 }
-func (c *Coordinator) reduceHandler(req *wkToCor, reply *corToWk) error {
+func (c *Coordinator) ReduceHandler(req *WkToCor, reply *CorToWk) error {
 	c.mu.Lock()
+	defer c.mu.Unlock()
 	// worker告知已经完成任务
-	if req.reqType == 1 {
-		completedId := req.completedTaskId
+	if req.ReqType == 1 {
+		completedId := req.CompletedTaskId
 		if c.reduceTask[completedId] == 1 {
 			c.reduceTask[completedId] = 2
 			c.completedReduceNum++
 		}
+		return nil
 	}
-	reply.respType = 1
-	reply.nReduce = c.nReduce
+	reply.RespType = 1
+	reply.NReduce = c.nReduce
 	if c.completedReduceNum < c.nReduce {
 		//表示没有需要的worker handle的map任务,
 		//workers将会循环请求直到cordinator发送wokers map任务结束，即所有map任务均已完成
-		reply.taskName = "*&……%noReduceTask"
+		reply.TaskName = "*&……%noReduceTask"
 	} else {
-		reply.taskName = "*&……%reduceTaskCompleted"
+		reply.TaskName = "*&……%reduceTaskCompleted"
 	}
 	for i := 0; i < len(c.reduceTask); i++ {
 		if c.reduceTask[i] == 0 {
 			c.reduceTask[i] = 1
-			reply.taskName = ""
-			reply.taskId = i
-			reply.nMap = len(c.mapTask)
+			reply.TaskName = ""
+			reply.TaskId = i
+			reply.NMap = len(c.mapTask)
+			fmt.Fprintf(os.Stdout, "coordinator: distribute reduce "+
+				"task, filename: %v, taskId: %v\n", reply.TaskName, reply.TaskId)
 			break
 		}
 	}
-	c.mu.Unlock()
 	return nil
 }
 
-//
 // start a thread that listens for RPCs from worker.go
-//
 func (c *Coordinator) server() {
 	// 注册rpc handler
 	rpc.Register(c)
@@ -101,13 +108,15 @@ func (c *Coordinator) server() {
 	go http.Serve(l, nil)
 }
 
-//
+// Done
 // main/mrcoordinator.go calls Done() periodically to find out
 // if the entire job has finished.
-//
 func (c *Coordinator) Done() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	ret := false
-
+	fmt.Fprintf(os.Stdout, "coordinator: completedMapNum: %d, completedReduceNum: %d \n",
+		c.completedMapNum, c.completedReduceNum)
 	if c.completedMapNum == len(c.mapTask) && c.completedReduceNum == c.nReduce {
 		return true
 	}
@@ -123,17 +132,13 @@ func (c *Coordinator) Done() bool {
 func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	mapTaskNum := len(files)
 	var mapTask = make([]int, mapTaskNum)
-	var reduceTask []int = make([]int, mapTaskNum)
+	var reduceTask = make([]int, nReduce)
+
 	c := Coordinator{files: files, mapTask: mapTask, reduceTask: reduceTask, completedMapNum: 0,
 		completedReduceNum: 0, nReduce: nReduce}
+	fmt.Fprintf(os.Stdout, "coordinator: coordinator parameter: %v\n", c)
 	/* process map request*/
-	for c.completedMapNum != mapTaskNum {
-		c.server()
-	}
-	/* process reduce request*/
-	for c.completedReduceNum != nReduce {
-		c.server()
-	}
+	c.server()
 
 	return &c
 }

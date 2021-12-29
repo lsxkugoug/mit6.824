@@ -102,13 +102,37 @@ mapreduce过程结束
 
 
 
-## Appendix
+## Appendix 
 
-set up go
+**set up go**
 
 https://go.dev/doc/install?download=go1.14.4.linux-amd64.tar.gz 
 
-linux脚本修复
+**linux脚本修复**
 
 sed -i 's/\r$//' test-mr.sh 
+
+**go语言问题：**
+在go中，以大写字母开头的字段和变量是“导出的”，对其他包可见。以小写字母开头的字段是“未导出的”，并且仅在它们自己的包内可见。
+
+struct和方法名如果在别的包里要使用 首字母均应大写, 且struct内部变量依旧需要大写
+
+int - > string 要用 strconv.Itoa 而不是直接string
+
+与c不一样，go创建文件不是用open 而是用os.create
+
+
+
+
+
+奇怪的问题
+
+worker第一个request taskId无法通过rpc获取, 但是在coordinator部分已经正确赋值
+
+coordinator: distribute map task, filename: ../pg-being_ernest.txt, taskId: 0
+coordinator: distribute map task, filename: ../pg-dorian_gray.txt, taskId: 1
+workers: workers get mapfile: ../pg-being_ernest.txt and taskId: -1
+workers: workers get mapfile: ../pg-dorian_gray.txt and taskId: 1
+
+
 

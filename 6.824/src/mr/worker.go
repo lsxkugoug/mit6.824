@@ -6,6 +6,7 @@ import (
 	"io/ioutil"
 	"os"
 	"sort"
+	"strconv"
 	"time"
 )
 import "log"
@@ -26,54 +27,72 @@ func (a ByKey) Len() int           { return len(a) }
 func (a ByKey) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
 func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
 
-//
 // use ihash(key) % NReduce to choose the reduce
 // task number for each KeyValue emitted by Map.
-//
 func ihash(key string) int {
 	h := fnv.New32a()
 	h.Write([]byte(key))
 	return int(h.Sum32() & 0x7fffffff)
 }
 
-// main/mrworker.go calls this function.
+// Worker main/mrworker.go calls this function.
 func Worker(mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
-
 	/* 处理map任务 */
-	req := wkToCor{0, -1}              //处理map之后完报告任务
-	resp := corToWk{0, "", -1, -1, -1} //接收coordinator分派的任务
 	// 直到master告知已经结束, 否则轮询
-	for resp.taskName != "&……%mapTaskCompleted" {
+	fmt.Fprintf(os.Stdout, "================== workers: start map tasks ===================\n")
+
+	for {
+		req := WkToCor{0, -1}           //处理map之后完报告任务
+		resp := CorToWk{0, "", 0, 0, 0} //接收coordinator分派的任务
 		// 申请任务
-		call("Coordinator.mapHandler", req, resp)
+		fmt.Fprintf(os.Stdout, "workers: woker apply map task!\n")
+		call("Coordinator.MapHandler", &req, &resp)
+		if resp.TaskName == "*&……%mapTaskCompleted" {
+			break
+		}
+		fmt.Fprintf(os.Stdout, "workers: get respon: %v from coordinator\n", resp)
 		// map处理文件
-		if resp.taskName != "*&……%noMapTask" && resp.taskName != "&……%mapTaskCompleted" {
+		if resp.TaskName != "*&……%noMapTask" && resp.TaskName != "*&……%mapTaskCompleted" {
 			res := mapTaskProcess(mapf, &resp) //使用map函数处理小文件
 			if res == false {
-				log.Fatalf("mapTask failed taskFileName = %v", resp.taskName)
+				log.Fatalf("mapTask failed taskFileName = %v", resp.TaskName)
 			}
-			req.reqType = 1 // 告知coordinator已经完成任务
-			req.completedTaskId = resp.taskId
-			call("Coordinator.mapHandler", req, resp)
+			req.ReqType = 1 // 告知coordinator已经完成任务
+			req.CompletedTaskId = resp.TaskId
+			fmt.Fprintf(os.Stdout, "workers: complete map task %d and inform coordinator\n", resp.TaskId)
+			call("Coordinator.MapHandler", &req, &resp)
 		} else {
+			//fmt.Fprintf(os.Stdout, "workers: get %s, sleep one second\n", resp.TaskName)
 			time.Sleep(time.Second)
 		}
 	}
+
+	fmt.Fprintf(os.Stdout, "==================workers: start reduce task======================\n")
+
 	/* 处理reduce任务 */
-	for resp.taskName != "&……%reduceTaskCompleted" {
+	req := WkToCor{0, -1}           //处理map之后完报告任务
+	resp := CorToWk{0, "", 0, 0, 0} //接收coordinator分派的任务
+	for {
+		req = WkToCor{0, -1}           //处理map之后完报告任务
+		resp = CorToWk{0, "", 0, 0, 0} //接收coordinator分派的任务
 		// 申请任务
-		call("Coordinator.reduceHandler", req, resp)
+		fmt.Fprintf(os.Stdout, "workers: woker apply reduce task!\n")
+		call("Coordinator.ReduceHandler", &req, &resp)
+		if resp.TaskName == "*&……%reduceTaskCompleted" {
+			break
+		}
 		// reduce处理intermediate
-		if resp.taskName != "*&……%noReduceTask" && resp.taskName != "&……%ReduceTaskCompleted" {
+		if resp.TaskName != "*&……%noReduceTask" && resp.TaskName != "&……%reduceTaskCompleted" {
 			res := reduceTaskProcess(reducef, &resp) //使用map函数处理小文件
 			if res == false {
-				log.Fatalf("reduceTask failed, reduceTaskId = %d", resp.taskId)
+				log.Fatalf("reduceTask failed, reduceTaskId = %d", resp.TaskId)
 			}
-			req.reqType = 1 // 告知coordinator已经完成任务
-			req.completedTaskId = resp.taskId
-			call("Coordinator.reduceHandler", req, resp)
+			req.ReqType = 1 // 告知coordinator已经完成任务
+			req.CompletedTaskId = resp.TaskId
+			call("Coordinator.ReduceHandler", &req, &resp)
 		} else {
+			fmt.Fprintf(os.Stdout, "workers: get %s, sleep one second\n", resp.TaskName)
 			time.Sleep(time.Second)
 		}
 	}
@@ -82,19 +101,19 @@ func Worker(mapf func(string, string) []KeyValue,
 /*
 将一个fileName里的word转化为 {word, 1} {word, 1} 这种形式进行保存
 */
-func mapTaskProcess(mapf func(string, string) []KeyValue, resp *corToWk) bool {
-	fileName := resp.taskName
+func mapTaskProcess(mapf func(string, string) []KeyValue, resp *CorToWk) bool {
+	fileName := resp.TaskName
 	intermediate := []KeyValue{}
-	nReduce := resp.nReduce
+	nReduce := resp.NReduce
 	// 创建 r 个file, 与json对象数组
 	intermediatsFiles := []*os.File{}
 	jsonEncoderList := []*json.Encoder{}
-	X := resp.taskId
+	X := resp.TaskId
 	for i := 0; i < nReduce; i++ {
-		tmpFileName := "mr-" + string(X) + "-" + string(i)
-		interFile, err := os.Open(tmpFileName)
+		tmpFileName := "mr-" + strconv.Itoa(X) + "-" + strconv.Itoa(i)
+		interFile, err := os.Create(tmpFileName)
 		if err != nil {
-			log.Fatalf("cannot open %v", tmpFileName)
+			log.Fatalf("cannot create %v", tmpFileName)
 			return false
 		}
 		jsonEncoderList = append(jsonEncoderList, json.NewEncoder(interFile))
@@ -123,20 +142,23 @@ func mapTaskProcess(mapf func(string, string) []KeyValue, resp *corToWk) bool {
 		}
 	}
 	for _, intermediatesfile := range intermediatsFiles {
-		intermediatesfile.Close()
+		err := intermediatesfile.Close()
+		if err != nil {
+			return false
+		}
 	}
 	return true
 }
 
 /* 拿到taskId之后,读取所有mr-X-taskId的内容 排序 双指针处理 */
-func reduceTaskProcess(reducef func(string, []string) string, resp *corToWk) bool {
+func reduceTaskProcess(reducef func(string, []string) string, resp *CorToWk) bool {
 	// 保存读取所有 mr-X-taskId 的数据,并保存为键值对
 	intermediate := []KeyValue{}
-	nMap := resp.nMap
-	// 接收 r 个file, 与json对象数组
-	Y := resp.taskId
+	nMap := resp.NMap
+	Y := resp.TaskId
+	// 读取所有与Y适配的文件，将文件中的键值对写入intermediate数组里
 	for X := 0; X < nMap; X++ {
-		tmpFileName := "mr-" + string(X) + "-" + string(Y)
+		tmpFileName := "mr-" + strconv.Itoa(X) + "-" + strconv.Itoa(Y)
 		interFile, err := os.Open(tmpFileName)
 		if err != nil {
 			log.Fatalf("cannot open %v", tmpFileName)
@@ -154,7 +176,7 @@ func reduceTaskProcess(reducef func(string, []string) string, resp *corToWk) boo
 
 	sort.Sort(ByKey(intermediate))
 
-	oname := "mr-out-" + string(Y)
+	oname := "mr-out-" + strconv.Itoa(Y)
 	ofile, _ := os.Create(oname)
 
 	i := 0
@@ -175,7 +197,10 @@ func reduceTaskProcess(reducef func(string, []string) string, resp *corToWk) boo
 		i = j
 	}
 
-	ofile.Close()
+	err := ofile.Close()
+	if err != nil {
+		return false
+	}
 
 	return true
 }
