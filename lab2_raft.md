@@ -53,11 +53,27 @@
    ##### 1.2实现部分细节
    
    1. 每次选完leader之后(或者初始状态), 要对heartBeatTimeOut进行在一定范围内的随机化，以防止多个candidate均试图成为Leader并投票给自己, 达不成共识
+   
    2. 一个replica在一个term里只能投一张票 如, s1在自己的term 3里只能投一张票
+   
    3. candidate退出循环的触发是收到了新leader的心跳
+   
    4. 如果旧leader上线, 收到了新leader的心跳(收到的term > 自己的term), 则应该退回followers
+   
    5. 如果是candidate, 发现收到了其他的candidate的请求且term大于自己, 则自己回退成followers并投票给它
+   
    6. 很多情况可以归结于这一条If RPC request or response contains term T > currentTerm: set currentTerm = T, convert to follower (§5.1)
+   
+   7. 如果一个循环很大一部分是被锁住的且用的一个锁,如
+   
+      ```
+      while timeout {
+      	lock
+      	unlock
+      }
+      ```
+   
+      则必须在循环内部加一个time.sleep，不然其他线程无法即使反馈数据,难以达成共识。
    
    
    
@@ -86,7 +102,7 @@ s3: 3	3
    ```
 	10	11	12			10	11	12			10	11	12
    s1:	3				s1:	3				s1:	3
-s2:	3	3			s2:	3	3	4		s2:	3	3	4
+	s2:	3	3			s2:	3	3	4		s2:	3	3	4
    s3:	3	3			s3:	3	3			s3:	3	3	5
    ```
 

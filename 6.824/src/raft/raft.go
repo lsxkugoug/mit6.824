@@ -18,10 +18,7 @@ package raft
 //
 
 import (
-	"fmt"
 	"math/rand"
-	"os"
-
 	//	"bytes"
 	"sync"
 	"sync/atomic"
@@ -77,9 +74,10 @@ type Raft struct {
 	// hearBeat计时器
 	lastHeartBeat    int64 // 上次的Leader heartbeat time
 	heartBeatFre     int64 // leader发送heartbeat的频率20ms
-	heartBeatTimeout int64 // 多久没有收到leader的heartBeat会发起选举 设置为350ms + rand(0,100)ms, 同时也是election timeout
+	heartBeatTimeout int64 // 心跳超时时间
 	//选举计时器
 	electionStartTime int64 //选举开始时间
+	electionTimeout   int64 // 选举超时时间
 	// 选票计数器
 	grantNum int
 
@@ -111,6 +109,7 @@ func (rf *Raft) GetState() (int, bool) {
 	// Your code here (2A).
 	term = rf.currentTerm
 	if rf.status == 2 {
+		//fmt.Fprintf(os.Stdout, "我是%d, term为:%d, 为leader\n", rf.me, rf.currentTerm)
 		isleader = true
 	}
 	return term, isleader
@@ -217,6 +216,7 @@ func (rf *Raft) RequestVoteHandler(args *RequestVoteArgs, reply *RequestVoteRepl
 	defer rf.mu.Unlock()
 	// Your code here (2A, 2B).
 	reply.Term = rf.currentTerm
+	rf.lastHeartBeat = time.Now().UnixMilli()
 	// 如果请求的term小于自己当前的term,消息过期
 	if args.Term < rf.currentTerm {
 		reply.VoteGanted = false
@@ -225,6 +225,12 @@ func (rf *Raft) RequestVoteHandler(args *RequestVoteArgs, reply *RequestVoteRepl
 	//正常处理逻辑
 	// 如果收到了比自己大的term 请求, 则修改自己的term并voteFor置为-1, 如果身份是candidate,回退为followers
 	if args.Term > rf.currentTerm {
+		if rf.status != 0 {
+			//fmt.Fprintf(os.Stdout, "我是%d号,我的term是:%d, 我的status是%d 我回退为follwers, 我收到了%d的vote请求,"+
+			//	"他的term为%d \n",
+			//	rf.me, rf.currentTerm, rf.status, args.CandidateId, args.Term)
+		}
+
 		rf.voteFor = -1
 		rf.currentTerm = args.Term
 		rf.status = 0
@@ -238,7 +244,11 @@ func (rf *Raft) RequestVoteHandler(args *RequestVoteArgs, reply *RequestVoteRepl
 	// If votedFor is null or candidateId, and candidate’s log is at least as up-to-date as receiver’s log, grant vote
 	if (rf.voteFor == -1 || rf.voteFor == args.CandidateId) &&
 		args.LastLogIndex >= myLastLogIndex && args.LastLogTerm >= myLastLogTerm {
+		rf.voteFor = args.CandidateId
 		reply.VoteGanted = true
+		//rf.status = 1
+		//fmt.Fprintf(os.Stdout, "我是%d号,我的term是:%d, 我的status是%d, 我投给%d号candiidate\n",
+		//	rf.me, rf.currentTerm, rf.status, args.CandidateId)
 	} else {
 		reply.VoteGanted = false
 	}
@@ -252,11 +262,15 @@ func (rf *Raft) AppendEntriesHandler(args *AppendEntriesArgs, reply *AppendEntri
 	if args.Type == 0 {
 		rf.lastHeartBeat = time.Now().UnixMilli()
 		// 假设此时状态为candidate且收到了其他人的心跳，且其他人的心跳还大于>=此时自己的,说明发出该心跳的也是一个candidate,并胜选
-		// 如果旧的leader上线, 它的term一定会比candidate竞选的要小,所以可以不考虑
-		if args.Term > rf.currentTerm {
+		// 如果旧的leader上线, 它的term一定会比candidate竞选的要小,所以可以不考虑,如果是心跳term和自己一样,则回退
+		if args.Term >= rf.currentTerm {
+			//fmt.Fprintf(os.Stdout, "我是%d号,我的term是:%d, 我的status是%d 我回退为follwers, 我收到了%d的心跳,"+
+			//	"他的term为%d \n",
+			//rf.me, rf.currentTerm, rf.status, args.LeaderId, args.Term)
 			rf.currentTerm = args.Term //变为新的term
 			rf.status = 0              // candidate竞选失败 回退至followers 或者 旧leader上线变为followers
 		}
+		reply.Term = rf.currentTerm
 		return
 	}
 	// 2.如果是日志同步 TODO
@@ -357,6 +371,9 @@ func (rf *Raft) killed() bool {
 
 /* ==============三个角色=============== */
 func (rf *Raft) followerBh() {
+	rf.mu.Lock()
+	rf.heartBeatTimeout = GetRdHbTo()
+	rf.mu.Unlock()
 	// 1. 查看是否需要进行选举 如果是转化为candidate状态
 	if !rf.checkHeartBeat() {
 		rf.mu.Lock()
@@ -374,60 +391,69 @@ func (rf *Raft) candidateBh() {
 	// 2.如果electionTimeout则重复选举
 	// 3.选举成功：自己成为leader
 
-	for {
-		//1. 退出条件 收到新的leader心跳并发现收到的心跳大于等于自己的currentTerm, 这个逻辑在AppendEntriesHandler里处理,发现这种情况且状态为candidate时, 改变candidate状态
-		//2. 发送leader election rpc
-		//变量设置
+	//1. 退出条件 收到新的leader心跳并发现收到的心跳大于等于自己的currentTerm, 这个逻辑在AppendEntriesHandler里处理,发现这种情况且状态为candidate时, 改变candidate状态
+	//2. 发送leader election rpc
+	//变量设置
+	rf.mu.Lock()
+	rf.electionTimeout = GetRdHbTo()
+	rf.electionStartTime = time.Now().UnixMilli()
+	rf.currentTerm += 1
+	rf.grantNum = 1
+	rf.voteFor = rf.me // 不投给其他人
+	lastLogTerm := -1
+	lastLogIndex := -1
+	//fmt.Fprintf(os.Stdout, "我是%d candidate, 尝试选举, term为 %d\n", rf.me, rf.currentTerm)
+	if len(rf.logs) > 0 {
+		lastLogTerm = rf.logs[len(rf.logs)-1].Term
+		lastLogIndex = len(rf.logs) - 1
+	}
+	rf.mu.Unlock()
+	// 发送请求 这里对于每个接收者均应开一个线程去处理结果, 不然一个时间等待很长会直接导致选举超时
+	for peer, _ := range rf.peers {
+		if peer == rf.me {
+			continue
+		}
 		rf.mu.Lock()
-		if rf.status != 1 {
-			rf.mu.Unlock()
-			break
-		}
-		rf.heartBeatTimeout = GetRdHbTo()
-		rf.electionStartTime = time.Now().UnixMilli()
-		rf.currentTerm += 1
-		rf.grantNum = 1
-		lastLogTerm := -1
-		lastLogIndex := -1
-		if len(rf.logs) > 0 {
-			lastLogTerm = rf.logs[len(rf.logs)-1].Term
-			lastLogIndex = len(rf.logs) - 1
-		}
+		args := RequestVoteArgs{Term: rf.currentTerm, CandidateId: rf.me,
+			LastLogIndex: lastLogIndex, LastLogTerm: lastLogTerm}
+		reply := RequestVoteReply{}
 		rf.mu.Unlock()
-		// 发送请求 这里对于每个接收者均应开一个线程去处理结果, 不然一个时间等待很长会直接导致选举超时
-		for peer, _ := range rf.peers {
-			if peer == rf.me {
-				continue
-			}
-			rf.mu.Lock()
-			args := RequestVoteArgs{Term: rf.currentTerm, CandidateId: rf.me,
-				LastLogIndex: lastLogIndex, LastLogTerm: lastLogTerm}
-			reply := RequestVoteReply{}
-			rf.mu.Unlock()
-			go rf.sendRequestVote(peer, &args, &reply)
-		}
-		// 超时逻辑
+		go rf.sendRequestVote(peer, &args, &reply)
+	}
+	// 超时逻辑
+	rf.mu.Lock()
+	rfElectionStartTime := rf.electionStartTime
+	rfElectionTimeout := rf.electionTimeout
+	rf.mu.Unlock()
+	for time.Now().UnixMilli()-rfElectionStartTime <= rfElectionTimeout {
+		// 成功竞选 leader
 		rf.mu.Lock()
-		rfElectionStartTime := rf.electionStartTime
-		rfHeartBeatTimeout := rf.heartBeatTimeout
-		rf.mu.Unlock()
-		for time.Now().UnixMilli()-rfElectionStartTime <= rfHeartBeatTimeout {
-			// 成功竞选 leader
-			rf.mu.Lock()
-			if rf.grantNum >= (len(rf.peers)+1)/2 {
-				fmt.Fprintf(os.Stdout, "一共%d个人, 收到%d张票\n", len(rf.peers), rf.grantNum)
-				rf.status = 2
-				rf.mu.Unlock()
+		if rf.grantNum >= (len(rf.peers)+1)/2 {
+			// 有可能在这里的时候已经变回了followers
+			if rf.status == 0 {
 				return
 			}
+			////fmt.Fprintf(os.Stdout, "我是%d号,我的term是:%d, 一共%d个人, 收到%d张票\n",
+			//	rf.me, rf.currentTerm, len(rf.peers), rf.grantNum)
+			rf.status = 2
 			rf.mu.Unlock()
-
+			return
 		}
-		// 否则 1.重新开一轮选举同时随机化heartbeat timeout 2.竞选失败 回退为followers
+		rf.mu.Unlock()
+		//如果不睡眠,因为这个锁覆盖了很大一部分循环,所以会导致其他地方的线程无法运行不能更新其变量,共识难以达成
+		time.Sleep(15 * time.Microsecond)
 	}
+	// 否则 1.重新开一轮选举同时随机化heartbeat timeout 2.竞选失败 回退为followers
+
 }
 
 func (rf *Raft) leaderBh() {
+	//成为leader之后立即发送一次心跳
+	//fmt.Fprintf(os.Stdout, "我是%d, term为%d leader\n", rf.me, rf.currentTerm)
+	for peer, _ := range rf.peers {
+		go rf.sendHeart(peer)
+	}
+	lastSendHeart := time.Now().UnixMilli()
 	for {
 		rf.mu.Lock()
 		if rf.status != 2 {
@@ -437,12 +463,12 @@ func (rf *Raft) leaderBh() {
 		rf.mu.Unlock()
 		// 1.定时发送heartBeat 每一个peer都需要一个线程进行监听
 		rf.mu.Lock()
-		if time.Now().UnixMilli()-rf.lastHeartBeat > rf.heartBeatFre {
+		if time.Now().UnixMilli()-lastSendHeart > rf.heartBeatFre {
 			for peer, _ := range rf.peers {
 				go rf.sendHeart(peer)
 			}
+			lastSendHeart = time.Now().UnixMilli()
 		}
-		rf.lastHeartBeat = time.Now().UnixMilli()
 		rf.mu.Unlock()
 
 		// TODO 处理请求以及同步日志部分
@@ -467,12 +493,20 @@ func (rf *Raft) sendHeart(server int) {
 			break
 		}
 		rf.mu.Unlock()
-		args := AppendEntriesArgs{Type: 0}
+		args := AppendEntriesArgs{Type: 0, LeaderId: rf.me}
 		reply := AppendEntriesReply{}
 		ok := rf.peers[server].Call("Raft.AppendEntriesHandler", &args, &reply)
 		if !ok {
 			//fmt.Println("========== sendHeart call failed ================")
 		}
+		rf.mu.Lock()
+		if reply.Term > rf.currentTerm {
+			//说明leader是旧leader应该滚蛋
+			rf.status = 0
+			rf.currentTerm = reply.Term
+		}
+		rf.mu.Unlock()
+
 	}
 }
 
@@ -503,7 +537,7 @@ func (rf *Raft) ticker() {
 
 // GetRdHbTo 获取随机heartBeatTimeout
 func GetRdHbTo() int64 {
-	return int64(350 + rand.Intn(100))
+	return int64(400 + rand.Intn(400))
 }
 
 //
@@ -522,9 +556,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// 2A
 	heartBeatTimeout := GetRdHbTo()
 	rf := &Raft{peers: peers, persister: persister, me: me, dead: 0, status: 0,
-		currentTerm: -1, voteFor: -1, lastHeartBeat: time.Now().UnixMilli(),
-		heartBeatFre: 20, heartBeatTimeout: heartBeatTimeout}
-
+		currentTerm: 0, voteFor: -1, lastHeartBeat: time.Now().UnixMilli(),
+		heartBeatFre: 100, heartBeatTimeout: heartBeatTimeout}
+	//fmt.Fprintf(os.Stdout, "初始化 一共有%d个人\n", len(peers))
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 

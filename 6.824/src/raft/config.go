@@ -8,7 +8,9 @@ package raft
 // test with the original before submitting.
 //
 
-import "6.824/labgob"
+import (
+	"6.824/labgob"
+)
 import "6.824/labrpc"
 import "bytes"
 import "log"
@@ -392,7 +394,7 @@ func (cfg *config) checkOneLeader() int {
 				lastTermWithLeader = term
 			}
 		}
-
+		//fmt.Fprintf(os.Stdout, "last term is %d\n", lastTermWithLeader)
 		if len(leaders) != 0 {
 			return leaders[lastTermWithLeader][0]
 		}
