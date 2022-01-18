@@ -1,15 +1,5 @@
 ## lab2 RAFT
 
-**raft的简要流程(无故障)**
-
-所有的请求都将转发给leader
-
-1. client向primary发送请求
-2. primary对所有子节点proposal
-3. 子节点投票，但不持久化数据，只是将该操作保存在自己的Log里。然后，将自己的投票结果返回primary
-4. primary计算票数，如果是majority, 向子节点发送"可以持久化数"据消息
-5. primary确定子节点已经持久化数据之后，将操作成功结果返回给client
-
 #### 五条公理
 
 1. 选举安全特性：对于给定的一个任期号, 最多只会有一个leader被选举出来。每一个replica只有一张选票
@@ -47,42 +37,42 @@
    **restriction：** 
 
    在election过程中, 只有 voter发现自己的log中最大的term小于等于candidate竞选发来的term时，才会投"yes" 原因可以看2.x的第三个例子
+
    
-   
-   
+
    ##### 1.2实现部分细节
-   
+
    1. 每次选完leader之后(或者初始状态), 要对heartBeatTimeOut进行在一定范围内的随机化，以防止多个candidate均试图成为Leader并投票给自己, 达不成共识
-   
+
    2. 一个replica在一个term里只能投一张票 如, s1在自己的term 3里只能投一张票
-   
+
    3. candidate退出循环的触发是收到了新leader的心跳
-   
+
    4. 如果旧leader上线, 收到了新leader的心跳(收到的term > 自己的term), 则应该退回followers
-   
+
    5. 如果是candidate, 发现收到了其他的candidate的请求且term大于自己, 则自己回退成followers并投票给它
-   
+
    6. 很多情况可以归结于这一条If RPC request or response contains term T > currentTerm: set currentTerm = T, convert to follower (§5.1)
-   
+
    7. 如果一个循环很大一部分是被锁住的且用的一个锁,如
-   
+
       ```
       while timeout {
       	lock
       	unlock
       }
       ```
-   
+
       则必须在循环内部加一个time.sleep，不然其他线程无法即使反馈数据,难以达成共识。
+
+   8.  每次一个角色转化为follower的时候,对lastHeartBeat进行重置
+
    
-   
-   
-   
-   
+
    #### 2. log replication
+
    
-   
-   
+
 ##### 2.x一些可能发生的问题分析以及解决
 
 1）simplest example
@@ -121,7 +111,7 @@ s1 一直因为网络分区, 丢失（11,3）
    ```
 	10	11	12	13
    s1:	3
-s2:	3	3	4
+   s2:	3	3	4
    s3:	3	3	5	6
    ```
 
@@ -141,15 +131,7 @@ leader初始化nextIdx为自己收到最新request的槽位, leader的nextIdx[s2
 
 **2) 重点：假设s1为leader会怎么样？它没有足够的log,也不是majority?**
 
-解释：因为在election过程中, 只有 voter发现自己的log中最大的term小于等于candidate竞选发来的term时，才会投"yes", 所以 选出来的leadr一定是term比majority要大的, 是可以对majority进行覆盖的
-
-
-
-
-
-
-
-   
+解释：因为在election过程中, 只有 voter发现自己的log中最大的term小于等于candidate竞选发来的term时，才会投"yes", 所以 选出来的leadr一定是term比majority要大的, 是可以对majority进行覆盖的   
 
 
 

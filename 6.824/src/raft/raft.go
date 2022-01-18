@@ -18,6 +18,7 @@ package raft
 //
 
 import (
+	"fmt"
 	"math/rand"
 	//	"bytes"
 	"sync"
@@ -52,8 +53,9 @@ type ApplyMsg struct {
 }
 
 type raftLog struct {
-	Op   string
-	Term int
+	Command interface{}
+	Term    int
+	Index   int
 }
 
 //
@@ -72,16 +74,20 @@ type Raft struct {
 
 	/* 2A leader election */
 	// hearBeat计时器
-	lastHeartBeat    int64 // 上次的Leader heartbeat time
+	lastHeartBeat    int64 //上一次收到heartbeat时间
 	heartBeatFre     int64 // leader发送heartbeat的频率20ms
-	heartBeatTimeout int64 // 心跳超时时间
+	heartBeatTimeout int64 // 心跳超时时间 同时也是选举超时时间
 	//选举计时器
 	electionStartTime int64 //选举开始时间
-	electionTimeout   int64 // 选举超时时间
 	// 选票计数器
 	grantNum int
 
-	/* 2B */
+	/* 2B log replication */
+	commitIndex int   // index of highest log entry known to be committed (initialized to 0, increases monotonically)
+	lastApplied int   // index of highest log entry applied to state machine (initialized to 0, increases monotonically)
+	nextIndex   []int // for each server, index of the next log entry to send to that server (initialized to leader last log index + 1)
+	matchIndex  []int // for each server, index of highest log entry known to be replicated on server (initialized to 0, increases monotonically)
+
 	/* 2C */
 	/* 2D */
 
@@ -216,9 +222,9 @@ func (rf *Raft) RequestVoteHandler(args *RequestVoteArgs, reply *RequestVoteRepl
 	defer rf.mu.Unlock()
 	// Your code here (2A, 2B).
 	reply.Term = rf.currentTerm
-	rf.lastHeartBeat = time.Now().UnixMilli()
 	// 如果请求的term小于自己当前的term,消息过期
 	if args.Term < rf.currentTerm {
+		reply.Term = rf.currentTerm
 		reply.VoteGanted = false
 		return
 	}
@@ -258,26 +264,46 @@ func (rf *Raft) RequestVoteHandler(args *RequestVoteArgs, reply *RequestVoteRepl
 func (rf *Raft) AppendEntriesHandler(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	// 1.如果是heartBeat
-	if args.Type == 0 {
-		rf.lastHeartBeat = time.Now().UnixMilli()
-		// 假设此时状态为candidate且收到了其他人的心跳，且其他人的心跳还大于>=此时自己的,说明发出该心跳的也是一个candidate,并胜选
-		// 如果旧的leader上线, 它的term一定会比candidate竞选的要小,所以可以不考虑,如果是心跳term和自己一样,则回退
-		if args.Term >= rf.currentTerm {
-			//fmt.Fprintf(os.Stdout, "我是%d号,我的term是:%d, 我的status是%d 我回退为follwers, 我收到了%d的心跳,"+
-			//	"他的term为%d \n",
-			//rf.me, rf.currentTerm, rf.status, args.LeaderId, args.Term)
-			rf.currentTerm = args.Term //变为新的term
-			rf.status = 0              // candidate竞选失败 回退至followers 或者 旧leader上线变为followers
-		}
+	if rf.currentTerm > args.Term {
 		reply.Term = rf.currentTerm
 		return
 	}
-	// 2.如果是日志同步 TODO
-	if args.Type == 1 {
+	rf.lastHeartBeat = time.Now().UnixMilli()
+	// 假设此时状态为candidate且收到了其他人的心跳或者append请求，且其他人的心跳还大于>=此时自己的,说明发出该心跳的也是一个candidate,并胜选
+	if args.Term > rf.currentTerm {
+		//fmt.Fprintf(os.Stdout, "我是%d号,我的term是:%d, 我的status是%d 我回退为follwers, 我收到了%d的心跳,"+
+		//	"他的term为%d \n",
+		//rf.me, rf.currentTerm, rf.status, args.LeaderId, args.Term)
+		rf.currentTerm = args.Term //变为新的term
+		rf.status = 0              // candidate竞选失败 回退至followers 或者 旧leader上线变为followers
+	}
+	// 1.如果是heartBeat
+	if args.Type == 0 {
+		reply.Term = rf.currentTerm
 		return
 	}
+	// 2.如果是日志同步
+	reply.Success = false
+	if args.Type == 1 {
+		fmt.Printf("出了问题 %d\n", 288)
+		// 如果preLogIndex == -1, 直接进行复制
+		if args.PrevLogIndex == -1 {
+			rf.logs = append(rf.logs, args.Entries...)
+			fmt.Printf("-1复制成功 %d\n", 292)
+			reply.Success = true
+			return
+		}
 
+		// 正常情况, 遍历一遍判断preLog是否存在
+		for i := len(rf.logs) - 1; i >= 0; i-- {
+			if rf.logs[i].Index == args.PrevLogIndex && rf.logs[i].Term == args.PrevLogTerm {
+				rf.logs = append(rf.logs[:i+1], args.Entries...)
+				reply.Success = true
+				break
+			}
+		}
+		return
+	}
 }
 
 //
@@ -324,6 +350,66 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	return ok
 }
 
+// logPrc: log正在处理的log的index 注意不是log[x].Index, 是x
+func (rf *Raft) synLogs(server int, logPrcIdx int) {
+	for {
+		// 说明leader挂了
+		if logPrcIdx == -1 {
+			return
+		}
+		rf.mu.Lock()
+		preLogIdx := -1
+		preLogTerm := -1
+		if logPrcIdx > 1 {
+			preLogIdx = rf.logs[logPrcIdx-1].Index
+			preLogTerm = rf.logs[logPrcIdx-1].Term
+		}
+		args := AppendEntriesArgs{
+			Type:         1,
+			Term:         rf.currentTerm,
+			LeaderId:     rf.me,
+			PrevLogIndex: preLogIdx,
+			PrevLogTerm:  preLogTerm,
+			LeaderCommit: rf.commitIndex,
+			Entries:      rf.logs[logPrcIdx:],
+		}
+		reply := AppendEntriesReply{}
+		rf.mu.Unlock()
+		//fmt.Printf("args = %v\n", args)
+		callRes := rf.peers[server].Call("Raft.AppendEntriesHandler", &args, &reply)
+
+		// 如果断线
+		if !callRes {
+			return
+		}
+		if reply.Term > rf.currentTerm {
+			rf.currentTerm = reply.Term
+			rf.status = 0
+			return
+		}
+		rf.mu.Lock()
+		if reply.Term > rf.currentTerm {
+			rf.status = 0
+			rf.currentTerm = reply.Term
+			break
+		}
+		// 如果失败 准备下一轮的共识
+		if reply.Success == false {
+			print("共识失败\n")
+			logPrcIdx -= 1
+		}
+
+		if reply.Success == true {
+			fmt.Printf("共识成功%d\n", logPrcIdx)
+			rf.nextIndex[server] = rf.logs[len(rf.logs)-1].Index + 1 //指向下一个要发送的index
+			rf.matchIndex[server] = rf.logs[len(rf.logs)-1].Index    // 已经同步的Index
+			break
+		}
+		rf.mu.Unlock()
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 //
 // the service using Raft (e.g. a k/v server) wants to start
 // agreement on the next command to be appended to Raft's log. if this
@@ -337,13 +423,54 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 // if it's ever committed. the second return value is the current
 // term. the third return value is true if this server believes it is
 // the leader.
-//
+//TODO 如果发现log里没有保存数据 是不是要导入 不然不知道上次的index是多少了 2B不用考虑
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
-	term := -1
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	// 如果log里没有数据, 则设置为0,0 TODO 在2D的时候 如果发现logs没数据 应该要加载 然后通过上一个的index获取这一轮的index
+	index := 0
+	term := rf.currentTerm
+	if len(rf.logs) > 0 {
+		index = 0
+	}
 	isLeader := true
+	if rf.status != 2 {
+		isLeader = false
+		return index, term, isLeader
+	}
+	fmt.Printf("start: 我的status:%d, 且我的term是 %d\n", rf.status, rf.currentTerm)
 
 	// Your code here (2B).
+	// add new log entry to local field
+	newLogIdx := 0
+	if len(rf.logs) > 0 {
+		newLogIdx = rf.logs[len(rf.logs)-1].Index + 1
+	}
+	rf.logs = append(rf.logs, raftLog{Term: term, Command: command, Index: newLogIdx})
+	// 尝试同步到其他节点上 nextIndex在leaderBH里初始化
+	lastLogIndex := -1
+	if len(rf.logs) > 0 {
+		lastLogIndex = rf.logs[len(rf.logs)-1].Index
+	}
+	for i := range rf.nextIndex {
+		if lastLogIndex >= rf.nextIndex[i] {
+			//fmt.Println("syblogs ", i, rf.nextIndex[i])
+			go rf.synLogs(i, len(rf.logs)-1)
+		}
+	}
+	// 每轮请求进来之后再对commitIndex进行更新 可能会慢一轮
+	for i := len(rf.logs) - 1; i >= 0; i-- {
+		vote := 0
+		for j := 0; j < len(rf.matchIndex); j++ {
+			if rf.matchIndex[j] >= rf.logs[i].Index {
+				vote++
+			}
+		}
+		if rf.logs[i].Term == rf.currentTerm && vote >= (len(rf.peers)+1)/2 {
+			rf.commitIndex = rf.logs[i].Index
+			break
+		}
+	}
 
 	return index, term, isLeader
 }
@@ -372,17 +499,20 @@ func (rf *Raft) killed() bool {
 /* ==============三个角色=============== */
 func (rf *Raft) followerBh() {
 	rf.mu.Lock()
+	rf.lastHeartBeat = time.Now().UnixMilli() //每次转化成followers的时候 重置timeout时间
 	rf.heartBeatTimeout = GetRdHbTo()
 	rf.mu.Unlock()
-	// 1. 查看是否需要进行选举 如果是转化为candidate状态
-	if !rf.checkHeartBeat() {
-		rf.mu.Lock()
-		rf.status = 1
-		rf.mu.Unlock()
-		return
+	for {
+		// 1. 查看是否需要进行选举 如果是转化为candidate状态
+		if !rf.checkHeartBeat() {
+			rf.mu.Lock()
+			rf.status = 1
+			rf.mu.Unlock()
+			return
+		}
+		// 2. 处理leader election信息 已由RequestVoteHandler处理
+		time.Sleep(10 * time.Millisecond)
 	}
-	// 2. 处理leader election信息 已由RequestVoteHandler处理
-
 }
 
 func (rf *Raft) candidateBh() {
@@ -395,7 +525,7 @@ func (rf *Raft) candidateBh() {
 	//2. 发送leader election rpc
 	//变量设置
 	rf.mu.Lock()
-	rf.electionTimeout = GetRdHbTo()
+	rf.heartBeatTimeout = GetRdHbTo()
 	rf.electionStartTime = time.Now().UnixMilli()
 	rf.currentTerm += 1
 	rf.grantNum = 1
@@ -423,7 +553,7 @@ func (rf *Raft) candidateBh() {
 	// 超时逻辑
 	rf.mu.Lock()
 	rfElectionStartTime := rf.electionStartTime
-	rfElectionTimeout := rf.electionTimeout
+	rfElectionTimeout := rf.heartBeatTimeout
 	rf.mu.Unlock()
 	for time.Now().UnixMilli()-rfElectionStartTime <= rfElectionTimeout {
 		// 成功竞选 leader
@@ -433,7 +563,7 @@ func (rf *Raft) candidateBh() {
 			if rf.status == 0 {
 				return
 			}
-			////fmt.Fprintf(os.Stdout, "我是%d号,我的term是:%d, 一共%d个人, 收到%d张票\n",
+			//fmt.Fprintf(os.Stdout, "我是%d号,我的term是:%d, 一共%d个人, 收到%d张票\n",
 			//	rf.me, rf.currentTerm, len(rf.peers), rf.grantNum)
 			rf.status = 2
 			rf.mu.Unlock()
@@ -444,7 +574,6 @@ func (rf *Raft) candidateBh() {
 		time.Sleep(15 * time.Microsecond)
 	}
 	// 否则 1.重新开一轮选举同时随机化heartbeat timeout 2.竞选失败 回退为followers
-
 }
 
 func (rf *Raft) leaderBh() {
@@ -454,6 +583,14 @@ func (rf *Raft) leaderBh() {
 		go rf.sendHeart(peer)
 	}
 	lastSendHeart := time.Now().UnixMilli()
+	// 初始化nextIndex[]为最后的Index + 1, matchIndex[]
+	rf.mu.Lock()
+	rf.nextIndex = make([]int, len(rf.peers))
+	rf.matchIndex = make([]int, len(rf.peers))
+	for i := 0; i < len(rf.peers) && len(rf.logs) > 0; i++ {
+		rf.nextIndex[i] = rf.logs[len(rf.logs)-1].Index + 1
+	}
+	rf.mu.Unlock()
 	for {
 		rf.mu.Lock()
 		if rf.status != 2 {
@@ -471,12 +608,10 @@ func (rf *Raft) leaderBh() {
 		}
 		rf.mu.Unlock()
 
-		// TODO 处理请求以及同步日志部分
-		//for {
-		//
-		//}
-	}
+		// 2B 同步日志部分写在start方法里 代表有新的request进来
+		time.Sleep(15 * time.Millisecond)
 
+	}
 }
 
 /*===============================*/
@@ -485,29 +620,19 @@ func (rf *Raft) leaderBh() {
 
 // leader发送心跳
 func (rf *Raft) sendHeart(server int) {
-	// 仅仅当自己还是Leader的时候发送
-	for {
-		rf.mu.Lock()
-		if rf.status != 2 {
-			rf.mu.Unlock()
-			break
-		}
-		rf.mu.Unlock()
-		args := AppendEntriesArgs{Type: 0, LeaderId: rf.me}
-		reply := AppendEntriesReply{}
-		ok := rf.peers[server].Call("Raft.AppendEntriesHandler", &args, &reply)
-		if !ok {
-			//fmt.Println("========== sendHeart call failed ================")
-		}
-		rf.mu.Lock()
-		if reply.Term > rf.currentTerm {
-			//说明leader是旧leader应该滚蛋
-			rf.status = 0
-			rf.currentTerm = reply.Term
-		}
-		rf.mu.Unlock()
-
+	args := AppendEntriesArgs{Type: 0, LeaderId: rf.me}
+	reply := AppendEntriesReply{}
+	ok := rf.peers[server].Call("Raft.AppendEntriesHandler", &args, &reply)
+	if !ok {
+		//fmt.Println("========== sendHeart call failed ================")
 	}
+	rf.mu.Lock()
+	if reply.Term > rf.currentTerm {
+		//说明leader是旧leader应该滚蛋
+		rf.status = 0
+		rf.currentTerm = reply.Term
+	}
+	rf.mu.Unlock()
 }
 
 /* =========================== */
@@ -531,7 +656,6 @@ func (rf *Raft) ticker() {
 		case 2:
 			rf.leaderBh()
 		}
-
 	}
 }
 
@@ -556,9 +680,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// 2A
 	heartBeatTimeout := GetRdHbTo()
 	rf := &Raft{peers: peers, persister: persister, me: me, dead: 0, status: 0,
-		currentTerm: 0, voteFor: -1, lastHeartBeat: time.Now().UnixMilli(),
-		heartBeatFre: 100, heartBeatTimeout: heartBeatTimeout}
-	//fmt.Fprintf(os.Stdout, "初始化 一共有%d个人\n", len(peers))
+		currentTerm: 0, voteFor: -1, heartBeatFre: 100, heartBeatTimeout: heartBeatTimeout, commitIndex: 0, lastApplied: 0}
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
