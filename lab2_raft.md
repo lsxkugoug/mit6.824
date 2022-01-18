@@ -135,41 +135,24 @@ leader初始化nextIdx为自己收到最新request的槽位, leader的nextIdx[s2
 
 
 
-##### 1.2数据结构
-
-**持久化的数据**, 保存进disk里，重启也能记忆
-
-1. currentTerm：server已知的最大任期, 通过心跳进行更新
-   2. votedFor:  在leader election中投票给了谁
-   3. log[]:  <operation, term, idx>
-   
-   **通用性易失数据**
-   
-   1.  
-   
-   
-   
-   
-
 
 
 ## 数据结构
 
+2B:
 
+大部分见论文
 
+leader的matchIndex[]是每个server已经mactch的最大index
 
+nextIndex是下次要同步的index
 
-## 细节部分
+当同步成功之后：
 
+```
+rf.nextIndex[server] = rf.logs[len(rf.logs)-1].Index + 1 //指向下一个要发送的index
+rf.matchIndex[server] = rf.logs[len(rf.logs)-1].Index    // 已经同步的Index
+```
 
-
-
-
-
-
-## Appendix
-
-go多线程
-
-
+要设置一个线程synchronize 这个线程循环等待，直到receiver发来success, 如果超时则直接退出循环。在代码中为`synLogs`函数
 
