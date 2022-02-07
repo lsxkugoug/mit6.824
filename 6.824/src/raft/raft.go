@@ -71,6 +71,7 @@ type Raft struct {
 	currentTerm int                 // 自己的term
 	voteFor     int                 // 投过的candidateId 每轮term只投给一个人
 	logs        []raftLog           // log
+	applyCh     chan ApplyMsg       // A channel to send apply message
 
 	/* 2A leader election */
 	// hearBeat计时器
@@ -285,11 +286,10 @@ func (rf *Raft) AppendEntriesHandler(args *AppendEntriesArgs, reply *AppendEntri
 	// 2.如果是日志同步
 	reply.Success = false
 	if args.Type == 1 {
-		fmt.Printf("出了问题 %d\n", 288)
 		// 如果preLogIndex == -1, 直接进行复制
 		if args.PrevLogIndex == -1 {
 			rf.logs = append(rf.logs, args.Entries...)
-			fmt.Printf("-1复制成功 %d\n", 292)
+			fmt.Printf("数组长度%d复制成功 %v\n", len(rf.logs), rf.logs)
 			reply.Success = true
 			return
 		}
@@ -352,6 +352,7 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 
 // logPrc: log正在处理的log的index 注意不是log[x].Index, 是x
 func (rf *Raft) synLogs(server int, logPrcIdx int) {
+	// 除非CALL失败 否则一直CALL
 	for {
 		// 说明leader挂了
 		if logPrcIdx == -1 {
@@ -382,12 +383,13 @@ func (rf *Raft) synLogs(server int, logPrcIdx int) {
 		if !callRes {
 			return
 		}
+
+		rf.mu.Lock()
 		if reply.Term > rf.currentTerm {
 			rf.currentTerm = reply.Term
 			rf.status = 0
 			return
 		}
-		rf.mu.Lock()
 		if reply.Term > rf.currentTerm {
 			rf.status = 0
 			rf.currentTerm = reply.Term
@@ -400,14 +402,35 @@ func (rf *Raft) synLogs(server int, logPrcIdx int) {
 		}
 
 		if reply.Success == true {
-			fmt.Printf("共识成功%d\n", logPrcIdx)
+			fmt.Printf("共识成功%d, %d号机, 共有%d号\n", logPrcIdx, server, len(rf.peers))
 			rf.nextIndex[server] = rf.logs[len(rf.logs)-1].Index + 1 //指向下一个要发送的index
 			rf.matchIndex[server] = rf.logs[len(rf.logs)-1].Index    // 已经同步的Index
+			rf.mu.Unlock()
 			break
 		}
 		rf.mu.Unlock()
+
 		time.Sleep(10 * time.Millisecond)
 	}
+	rf.mu.Lock()
+	// 检查日志信息,并尝试更新apply,写在这里的原因是 总有一个最慢同步
+	for i := len(rf.logs) - 1; i >= 0; i-- {
+		vote := 0
+		for j := 0; j < len(rf.matchIndex); j++ {
+			if rf.matchIndex[j] >= rf.logs[i].Index {
+				vote++
+			}
+		}
+		if rf.logs[i].Term == rf.currentTerm && vote >= len(rf.peers)/2 {
+			rf.commitIndex = rf.logs[i].Index
+			//fmt.Printf("log数据结构 %v\n", rf.logs)
+			rf.mu.Unlock()
+			rf.ApplyLogs(i)
+			rf.mu.Lock()
+			break
+		}
+	}
+	rf.mu.Unlock()
 }
 
 //
@@ -438,11 +461,11 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		isLeader = false
 		return index, term, isLeader
 	}
-	fmt.Printf("start: 我的status:%d, 且我的term是 %d\n", rf.status, rf.currentTerm)
+	fmt.Printf("我是%d leader,start: 我的status:%d, 且我的term是 %d\n", rf.me, rf.status, rf.currentTerm)
 
 	// Your code here (2B).
 	// add new log entry to local field
-	newLogIdx := 0
+	newLogIdx := 1
 	if len(rf.logs) > 0 {
 		newLogIdx = rf.logs[len(rf.logs)-1].Index + 1
 	}
@@ -458,21 +481,34 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 			go rf.synLogs(i, len(rf.logs)-1)
 		}
 	}
-	// 每轮请求进来之后再对commitIndex进行更新 可能会慢一轮
-	for i := len(rf.logs) - 1; i >= 0; i-- {
-		vote := 0
-		for j := 0; j < len(rf.matchIndex); j++ {
-			if rf.matchIndex[j] >= rf.logs[i].Index {
-				vote++
-			}
-		}
-		if rf.logs[i].Term == rf.currentTerm && vote >= (len(rf.peers)+1)/2 {
-			rf.commitIndex = rf.logs[i].Index
+
+	return index, term, isLeader
+}
+
+func (rf *Raft) ApplyLogs(logIdx int) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	// fmt.Printf("%d, %d, %d, %d, %v\n", rf.me, rf.status, rf.lastApplied, rf.commitIndex, rf.logs)
+	i := logIdx
+	for ; i >= 0; i-- {
+		if rf.logs[i].Index == rf.lastApplied {
 			break
 		}
 	}
+	// if no log
+	if i == -1 {
+		i = 0
+	}
+	for ; i <= logIdx; i++ {
+		rf.applyCh <- ApplyMsg{
+			CommandValid: true,
+			Command:      rf.logs[i].Command,
+			CommandIndex: rf.logs[i].Index,
+		}
+		rf.lastApplied = rf.logs[i].Index
+		fmt.Printf("apply %v\n", rf.logs[i])
 
-	return index, term, isLeader
+	}
 }
 
 //
@@ -609,8 +645,8 @@ func (rf *Raft) leaderBh() {
 		rf.mu.Unlock()
 
 		// 2B 同步日志部分写在start方法里 代表有新的request进来
-		time.Sleep(15 * time.Millisecond)
 
+		time.Sleep(15 * time.Millisecond)
 	}
 }
 
@@ -680,7 +716,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// 2A
 	heartBeatTimeout := GetRdHbTo()
 	rf := &Raft{peers: peers, persister: persister, me: me, dead: 0, status: 0,
-		currentTerm: 0, voteFor: -1, heartBeatFre: 100, heartBeatTimeout: heartBeatTimeout, commitIndex: 0, lastApplied: 0}
+		currentTerm: 0, voteFor: -1, heartBeatFre: 100, heartBeatTimeout: heartBeatTimeout,
+		commitIndex: 0, lastApplied: 0, applyCh: applyCh}
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
