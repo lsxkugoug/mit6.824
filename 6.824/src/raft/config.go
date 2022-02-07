@@ -158,6 +158,7 @@ func (cfg *config) checkLogs(i int, m ApplyMsg) (string, bool) {
 // contents
 func (cfg *config) applier(i int, applyCh chan ApplyMsg) {
 	for m := range applyCh {
+		fmt.Printf("applier: %v\n", m)
 		if m.CommandValid == false {
 			// ignore other types of ApplyMsg
 		} else {
@@ -394,7 +395,7 @@ func (cfg *config) checkOneLeader() int {
 				lastTermWithLeader = term
 			}
 		}
-		//fmt.Fprintf(os.Stdout, "last term is %d\n", lastTermWithLeader)
+
 		if len(leaders) != 0 {
 			return leaders[lastTermWithLeader][0]
 		}
@@ -443,7 +444,7 @@ func (cfg *config) nCommitted(index int) (int, interface{}) {
 		cfg.mu.Lock()
 		cmd1, ok := cfg.logs[i][index]
 		cfg.mu.Unlock()
-
+		fmt.Printf("nCommmitted: ok:%v,cmd1%v, cmd%v\n", ok, cmd1, cmd)
 		if ok {
 			if count > 0 && cmd != cmd1 {
 				cfg.t.Fatalf("committed values do not match: index %v, %v, %v\n",
@@ -528,6 +529,7 @@ func (cfg *config) one(cmd interface{}, expectedServers int, retry bool) int {
 			t1 := time.Now()
 			for time.Since(t1).Seconds() < 2 {
 				nd, cmd1 := cfg.nCommitted(index)
+				//fmt.Printf("nd:%v, cmd1:%v, cmd:%v\n", nd, cmd1, cmd)
 				if nd > 0 && nd >= expectedServers {
 					// committed
 					if cmd1 == cmd {

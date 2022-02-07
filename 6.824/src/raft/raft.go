@@ -24,7 +24,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-
 	//	"6.824/labgob"
 	"6.824/labrpc"
 )
@@ -438,9 +437,8 @@ func (rf *Raft) checkCommit() {
 		}
 		if rf.logs[i].Term == rf.currentTerm && vote >= len(rf.peers)/2 {
 			rf.commitIndex = rf.logs[i].Index
-			//fmt.Printf("log数据结构 %v\n", rf.logs)
 			rf.mu.Unlock()
-			rf.ApplyLogs(i)
+			go rf.ApplyLogs(i)
 			go rf.notifyCommit()
 			rf.mu.Lock()
 			break
@@ -544,7 +542,6 @@ func (rf *Raft) ApplyLogs(logIdx int) {
 	if i == -1 {
 		i = 0
 	}
-
 	for ; i <= logIdx; i++ {
 		rf.applyCh <- ApplyMsg{
 			CommandValid: true,
@@ -552,7 +549,11 @@ func (rf *Raft) ApplyLogs(logIdx int) {
 			CommandIndex: rf.logs[i].Index,
 		}
 		rf.lastApplied = rf.logs[i].Index
-		fmt.Printf("I am %d, apply %v\n", rf.me, rf.logs[i])
+		fmt.Printf("I am %d, apply %v\n", rf.me, ApplyMsg{
+			CommandValid: true,
+			Command:      rf.logs[i].Command,
+			CommandIndex: rf.logs[i].Index,
+		})
 	}
 }
 
@@ -759,9 +760,19 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	persister *Persister, applyCh chan ApplyMsg) *Raft {
 	// 2A
 	heartBeatTimeout := GetRdHbTo()
-	rf := &Raft{peers: peers, persister: persister, me: me, dead: 0, status: 0,
-		currentTerm: 0, voteFor: -1, heartBeatFre: 100, heartBeatTimeout: heartBeatTimeout,
-		commitIndex: 0, lastApplied: 0, applyCh: applyCh}
+	rf := &Raft{peers: peers,
+		persister:        persister,
+		me:               me,
+		dead:             0,
+		status:           0,
+		currentTerm:      0,
+		voteFor:          -1,
+		heartBeatFre:     100,
+		heartBeatTimeout: heartBeatTimeout,
+		commitIndex:      0,
+		lastApplied:      0,
+		applyCh:          applyCh}
+
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
