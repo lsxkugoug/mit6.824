@@ -200,7 +200,7 @@ type RequestVoteReply struct {
 	VoteGanted bool // true means candidate received vote
 }
 type AppendEntriesArgs struct {
-	Type         int       // 0 heartBeat, 1 try to synchronize log
+	Type         int       // 0 heartBeat, 1 try to synchronize log, 2 notify followers to apply logs
 	Term         int       //leader's term
 	LeaderId     int       //so follower can redirect client
 	PrevLogIndex int       //index of log entry immediately preceding new ones
@@ -265,6 +265,7 @@ func (rf *Raft) RequestVoteHandler(args *RequestVoteArgs, reply *RequestVoteRepl
 func (rf *Raft) AppendEntriesHandler(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	// 不论是什么情况 每次都进行heartbeat控制
 	if rf.currentTerm > args.Term {
 		reply.Term = rf.currentTerm
 		return
@@ -278,18 +279,13 @@ func (rf *Raft) AppendEntriesHandler(args *AppendEntriesArgs, reply *AppendEntri
 		rf.currentTerm = args.Term //变为新的term
 		rf.status = 0              // candidate竞选失败 回退至followers 或者 旧leader上线变为followers
 	}
-	// 1.如果是heartBeat
-	if args.Type == 0 {
-		reply.Term = rf.currentTerm
-		return
-	}
 	// 2.如果是日志同步
 	reply.Success = false
 	if args.Type == 1 {
 		// 如果preLogIndex == -1, 直接进行复制
 		if args.PrevLogIndex == -1 {
-			rf.logs = append(rf.logs, args.Entries...)
-			fmt.Printf("数组长度%d复制成功 %v\n", len(rf.logs), rf.logs)
+			rf.logs = args.Entries
+			//fmt.Printf("I am %d, 数组长度%d复制成功 %v\n", rf.me, len(rf.logs), rf.logs)
 			reply.Success = true
 			return
 		}
@@ -303,6 +299,20 @@ func (rf *Raft) AppendEntriesHandler(args *AppendEntriesArgs, reply *AppendEntri
 			}
 		}
 		return
+	}
+	// 3. 如果是notify commit
+	if args.Type == 2 {
+		// verify whether I have the leaderCommitIdex, since the machine may offline before
+		CommitIdx := -1
+		for i := len(rf.logs) - 1; i >= 0; i-- {
+			if rf.logs[i].Index == args.LeaderCommit {
+				CommitIdx = i
+			}
+		}
+		if CommitIdx == -1 {
+			return
+		}
+		go rf.ApplyLogs(CommitIdx)
 	}
 }
 
@@ -371,7 +381,6 @@ func (rf *Raft) synLogs(server int, logPrcIdx int) {
 			LeaderId:     rf.me,
 			PrevLogIndex: preLogIdx,
 			PrevLogTerm:  preLogTerm,
-			LeaderCommit: rf.commitIndex,
 			Entries:      rf.logs[logPrcIdx:],
 		}
 		reply := AppendEntriesReply{}
@@ -402,18 +411,24 @@ func (rf *Raft) synLogs(server int, logPrcIdx int) {
 		}
 
 		if reply.Success == true {
-			fmt.Printf("共识成功%d, %d号机, 共有%d号\n", logPrcIdx, server, len(rf.peers))
+			//fmt.Printf("共识成功%d, %d号机, 共有%d号\n", logPrcIdx, server, len(rf.peers))
 			rf.nextIndex[server] = rf.logs[len(rf.logs)-1].Index + 1 //指向下一个要发送的index
 			rf.matchIndex[server] = rf.logs[len(rf.logs)-1].Index    // 已经同步的Index
 			rf.mu.Unlock()
+			//check logs that whether should be committed(majority)
+			//Besides, if committed, notify other nodes to keep up
+			rf.checkCommit()
 			break
 		}
 		rf.mu.Unlock()
 
 		time.Sleep(10 * time.Millisecond)
 	}
+
+}
+
+func (rf *Raft) checkCommit() {
 	rf.mu.Lock()
-	// 检查日志信息,并尝试更新apply,写在这里的原因是 总有一个最慢同步
 	for i := len(rf.logs) - 1; i >= 0; i-- {
 		vote := 0
 		for j := 0; j < len(rf.matchIndex); j++ {
@@ -426,9 +441,31 @@ func (rf *Raft) synLogs(server int, logPrcIdx int) {
 			//fmt.Printf("log数据结构 %v\n", rf.logs)
 			rf.mu.Unlock()
 			rf.ApplyLogs(i)
+			go rf.notifyCommit()
 			rf.mu.Lock()
 			break
 		}
+	}
+	rf.mu.Unlock()
+}
+
+// when leadr commit a log, notify other nodes to commit it either.
+func (rf *Raft) notifyCommit() {
+	rf.mu.Lock()
+	for server := range rf.peers {
+		args := AppendEntriesArgs{
+			Type:         2,
+			Term:         rf.currentTerm,
+			LeaderId:     rf.me,
+			LeaderCommit: rf.commitIndex,
+		}
+		reply := AppendEntriesReply{}
+		rf.mu.Unlock()
+		Call := rf.peers[server].Call("Raft.AppendEntriesHandler", &args, &reply)
+		if Call == false {
+			fmt.Printf("Call 失败")
+		}
+		rf.mu.Lock()
 	}
 	rf.mu.Unlock()
 }
@@ -469,6 +506,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	if len(rf.logs) > 0 {
 		newLogIdx = rf.logs[len(rf.logs)-1].Index + 1
 	}
+	fmt.Printf("append %v log\n", raftLog{Term: term, Command: command, Index: newLogIdx})
 	rf.logs = append(rf.logs, raftLog{Term: term, Command: command, Index: newLogIdx})
 	// 尝试同步到其他节点上 nextIndex在leaderBH里初始化
 	lastLogIndex := -1
@@ -485,20 +523,28 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	return index, term, isLeader
 }
 
+// for leader and followers and send the logs to the tester
+// logIdx is the idx of rf.logS corresponding to commitedIdx
 func (rf *Raft) ApplyLogs(logIdx int) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	// fmt.Printf("%d, %d, %d, %d, %v\n", rf.me, rf.status, rf.lastApplied, rf.commitIndex, rf.logs)
+	// i 为lastApplied
 	i := logIdx
 	for ; i >= 0; i-- {
 		if rf.logs[i].Index == rf.lastApplied {
 			break
 		}
 	}
+	// 若已经apply过了
+	if i == logIdx {
+		return
+	}
 	// if no log
 	if i == -1 {
 		i = 0
 	}
+
 	for ; i <= logIdx; i++ {
 		rf.applyCh <- ApplyMsg{
 			CommandValid: true,
@@ -506,8 +552,7 @@ func (rf *Raft) ApplyLogs(logIdx int) {
 			CommandIndex: rf.logs[i].Index,
 		}
 		rf.lastApplied = rf.logs[i].Index
-		fmt.Printf("apply %v\n", rf.logs[i])
-
+		fmt.Printf("I am %d, apply %v\n", rf.me, rf.logs[i])
 	}
 }
 
@@ -645,7 +690,6 @@ func (rf *Raft) leaderBh() {
 		rf.mu.Unlock()
 
 		// 2B 同步日志部分写在start方法里 代表有新的request进来
-
 		time.Sleep(15 * time.Millisecond)
 	}
 }

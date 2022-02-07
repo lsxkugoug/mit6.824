@@ -133,6 +133,16 @@ leader初始化nextIdx为自己收到最新request的槽位, leader的nextIdx[s2
 
 解释：因为在election过程中, 只有 voter发现自己的log中最大的term小于等于candidate竞选发来的term时，才会投"yes", 所以 选出来的leadr一定是term比majority要大的, 是可以对majority进行覆盖的   
 
+##### 3.leader commit
+
+在AppendEntries RPC中有一个变量：`leaderCommit`
+
+有这个变量的原因是:
+
+ leader同步日志给其他角色, 如果他发现集群内有超过半数的人同意(虽然半数人同意了 但实际上并未提交该日志,必须等Leader确认达到半数要求之后才进行commit), 他就commit这个日志, 另commitIdx等于这个, 并且向其他的机器发送"我已经commit了, 这个日志是安全的, 你们也可以去apply了"
+
+
+
 
 
 
